@@ -381,12 +381,14 @@ class ONNXQuantizer:
         # Reduce min and Reduce max
         input_scale_name = input_name + "_scale"
 
+        #生成ReduceMin节点（计算输入张量的全局最小值）
         reduce_min_name = input_name + "_ReduceMin"
         reduce_min_node = onnx.helper.make_node("ReduceMin", [input_name], [reduce_min_name + ":0"],
                                                 reduce_min_name,
                                                 keepdims=0)  # 算子类型：ReduceMin（ONNX 内置算子，用于沿所有维度求最小值）。输入：[input_name]（待量化的原始输入张量）。输出：[reduce_min_name + ":0"]
         nodes_list.append(reduce_min_node) #将生成的节点追加到nodes_list
 
+        #生成ReduceMax节点（计算输入张量的全局最大值）
         reduce_max_name = input_name + "_ReduceMax"
         reduce_max_node = onnx.helper.make_node("ReduceMax", [input_name], [reduce_max_name + ":0"],
                                                 reduce_max_name,
@@ -394,12 +396,12 @@ class ONNXQuantizer:
         nodes_list.append(reduce_max_node)
 
         # Compute scale
-        #   Find abs(rmin) #第一步是求最小值的绝对值（abs (rmin)）
+        #   Find abs(rmin) #生成Abs节点,求最小值的绝对值（abs (rmin)）
         reduce_min_abs_name = reduce_min_name + "_Abs"
         reduce_min_abs_node = onnx.helper.make_node("Abs", [reduce_min_node.output[0]], [reduce_min_abs_name + ":0"],  #输入：reduce_min_node.output[0]（之前ReduceMin节点的输出，即输入张量的最小值）。
                                                     reduce_min_abs_name)
         nodes_list.append(reduce_min_abs_node)
-        #   Find abs(rmax)
+        #   Find abs(rmax) #生成Abs节点,计算最大值的绝对值，abs (rmax)
         reduce_max_abs_name = reduce_max_name + "_Abs"
         reduce_max_abs_node = onnx.helper.make_node("Abs", [reduce_max_node.output[0]], [reduce_max_abs_name + ":0"],  #输入改为reduce_max_node.output[0]（ReduceMax节点的输出，即输入张量的最大值）。
                                                     reduce_max_abs_name)
@@ -410,18 +412,32 @@ class ONNXQuantizer:
                                              [abs_max_name + ":0"], abs_max_name)
         nodes_list.append(abs_max_node)
         #   and divide by (quantize_range/2.0) which will be equal to max(...)*2.0/quantize_range
+           #将上述 “较大值” 除以 “量化范围的一半”（即quantize_range/2.0），最终得到缩放因子（scale = max (...) / (quantize_range/2.0)）。
+        """
+            生成量化范围常量（用于除法计算）：
+               名称：self.fixed_qrange_int8_name（之前定义的固定名称，即 “fixed_quantization_range_int8”）。
+               类型：FLOAT（浮点型，确保除法精度）。
+               形状：[]（标量，无维度）。
+               值：get_qrange_for_qType(qType) / 2.0——get_qrange_for_qType是工具函数，返回 INT8 的量化范围（即 255，因为 INT8 范围是 - 128~127，共 256 个值，量化范围取 255），除以 2 后为 127.5。
+        """
         initializer_div = onnx.helper.make_tensor(self.fixed_qrange_int8_name, onnx_proto.TensorProto.FLOAT, [],
                                                   [get_qrange_for_qType(qType) / 2.0])
-        self.model.add_initializer(initializer_div)
+        self.model.add_initializer(initializer_div)  #将该常量添加到模型（self.model.add_initializer），供后续除法节点使用
+
+        #生成Div节点（计算缩放因子 scale）
         scale_div_name = input_name + "scale_Div"
-        scale_div_node = onnx.helper.make_node("Div", [abs_max_node.output[0], self.fixed_qrange_int8_name],
-                                               [input_scale_name], scale_div_name)
+        scale_div_node = onnx.helper.make_node("Div", [abs_max_node.output[0], self.fixed_qrange_int8_name],  # 算子类型：Div（执行除法运算，输入 1 ÷ 输入 2）。  输入：abs_max_node.output[0]（max (abs (rmin), abs (rmax))）和self.fixed_qrange_int8_name（量化范围常量 127.5）。                                                                                        
+                                               [input_scale_name], scale_div_name)                            # 输出：input_scale_name（最终的缩放因子张量，即 scale = max (...) / 127.5）。                                                                    
         nodes_list.append(scale_div_node)
 
-        # Zero point
-        initializer_zp = onnx.helper.make_tensor(self.fixed_zero_zp_name, qType, [], [0])
-        self.model.add_initializer(initializer_zp)
+        # Zero point  #处理零点（zero_point）；生成 INT8 对称量化的零点常量初始化器
+        initializer_zp = onnx.helper.make_tensor(self.fixed_zero_zp_name, qType, [], [0]) #INT8 对称量化的零点固定为 0（因量化范围以 0 为中心，无需偏移）
+        self.model.add_initializer(initializer_zp) 
 
+        #返回动态量化参数的关键信息：
+           # input_scale_name：计算得到的缩放因子张量名称。
+           # self.fixed_zero_zp_name：固定零点张量名称（即 “fixed_zero_zp”）。
+           # 两个空列表：分别对应缩放因子和零点的形状（因两者均为标量，形状为空）。
         return input_scale_name, self.fixed_zero_zp_name, [], []
 
     def _get_dynamic_input_quantization_params_uint8(self, input_name, nodes_list):
@@ -436,12 +452,14 @@ class ONNXQuantizer:
         input_scale_name = input_name + "_scale"
         input_zp_name = input_name + "_zero_point"
 
+        #生成ReduceMin节点（计算输入张量的全局最小值）
         reduce_min_name = input_name + "_ReduceMin"
         reduce_min_node = onnx.helper.make_node("ReduceMin", [input_name], [reduce_min_name + ":0"],
                                                 reduce_min_name,
                                                 keepdims=0)
         nodes_list.append(reduce_min_node)
 
+        #生成ReduceMax节点（计算输入张量的全局最大值）
         reduce_max_name = input_name + "_ReduceMax"
         reduce_max_node = onnx.helper.make_node("ReduceMax", [input_name], [reduce_max_name + ":0"],
                                                 reduce_max_name,
@@ -455,36 +473,36 @@ class ONNXQuantizer:
         initializer_qvalue = onnx.helper.make_tensor(self.fixed_zero_name, onnx_proto.TensorProto.FLOAT, [], [0.0])
         self.model.add_initializer(initializer_qvalue)
 
-        # Compute Scale
-        #   Subtract rmax and rmin
+        # Compute Scale  计算缩放因子；
+        #   Subtract rmax and rmin  #生成Sub节点（执行减法运算）
         scale_sub_name = input_name + "_scale_Sub"
         scale_sub_node = onnx.helper.make_node("Sub", [reduce_max_node.output[0], reduce_min_node.output[0]],
                                                [scale_sub_name + ":0"], scale_sub_name)
         nodes_list.append(scale_sub_node)
-        #   and divide by quantize range
+        #   and divide by quantize range  #生成Div节点（计算缩放因子 scale）
         scale_div_name = input_name + "_scale_Div"
-        scale_div_node = onnx.helper.make_node("Div", [scale_sub_node.output[0], self.fixed_qrange_uint8_name],
+        scale_div_node = onnx.helper.make_node("Div", [scale_sub_node.output[0], self.fixed_qrange_uint8_name],  # scale = (abs(max) - abs(min))/quantize_range
                                                [input_scale_name], scale_div_name)
         nodes_list.append(scale_div_node)
 
-        # Compute zero point
-        #   Subtract zero and rmin
+        # Compute zero point    #开始计算零点；
+        #   Subtract zero and rmin  #生成Sub节点 (计算 “零值 - 最小值”（即 0 - min）)
         zp_sub_name = input_name + "_zero_point_Sub"
         zp_sub_node = onnx.helper.make_node("Sub", [self.fixed_zero_name, reduce_min_node.output[0]],
                                             [zp_sub_name + ":0"], zp_sub_name)
         nodes_list.append(zp_sub_node)
-        #   Divide by scale
+        #   Divide by scale  #生成Div节点 (计算零点的中间值)
         zp_div_name = input_name + "_zero_point_Div"
-        zp_div_node = onnx.helper.make_node("Div", [zp_sub_node.output[0], input_scale_name], [zp_div_name + ":0"],
-                                            zp_div_name)
+        zp_div_node = onnx.helper.make_node("Div", [zp_sub_node.output[0], input_scale_name], [zp_div_name + ":0"],  #算子类型：Div（(0 - min) ÷ scale） ， 输入：zp_sub_node.output[0]（0 - min）、input_scale_name（之前计算的缩放因子）。
+                                            zp_div_name)  #输出：zp_div_name + ":0"（零点的浮点中间值）。
         nodes_list.append(zp_div_node)
-        #   Compute floor
+        #   Compute floor    #生成Floor节点 (对零点中间值取整)
         zp_floor_name = input_name + "_zero_point_Floor"
-        zp_floor_node = onnx.helper.make_node("Floor", zp_div_node.output, [zp_floor_name + ":0"], zp_floor_name)
+        zp_floor_node = onnx.helper.make_node("Floor", zp_div_node.output, [zp_floor_name + ":0"], zp_floor_name)  #算子类型：Floor（向下取整，确保零点为整数，符合 UINT8 量化要求）。输入：zp_div_node.output（零点的浮点中间值）。
         nodes_list.append(zp_floor_node)
-        #   Cast to integer
+        #   Cast to integer  #生成Cast节点（将零点转换为 UINT8 类型）
         zp_cast_name = input_name + "_zero_point_Cast"
-        zp_cast_node = onnx.helper.make_node("Cast", zp_floor_node.output, [input_zp_name], zp_cast_name, to=qType)
+        zp_cast_node = onnx.helper.make_node("Cast", zp_floor_node.output, [input_zp_name], zp_cast_name, to=qType) #算子类型：Cast（类型转换); 输入：zp_floor_node.output（取整后的零点值）。输出：input_zp_name（最终的 UINT8 类型零点张量）。参数：to=qType（目标类型为 UINT8）。
         nodes_list.append(zp_cast_node)
 
         return input_scale_name, input_zp_name, [], []
@@ -579,6 +597,10 @@ class ONNXQuantizer:
             return self.parent.find_quantized_value(input_name)
         return None
 
+"""
+该方法，用于对模型中的偏置（bias）进行静态量化处理。
+根据文档字符串说明，偏置量化的规则是：零点（Zero Point）固定为 0，缩放因子（Scale）等于输入的缩放因子乘以权重的缩放因子
+"""
     def quantize_bias_static(self, bias_name, input_name, weight_name):
         '''
         Quantized the bias. Zero Point == 0 and Scale == Input_Scale * Weight_Scale
@@ -588,57 +610,59 @@ class ONNXQuantizer:
         if bias_name in self.quantized_value_map:
             return self.quantized_value_map[bias_name].q_name
 
-        # get scale for weight
-        weight_scale_name = self.quantized_value_map[weight_name].scale_name
-        weight_initializer = find_by_name(weight_scale_name, self.model.initializer())
-        weight_scale = self.tensor_proto_to_array(weight_initializer)
+        # get scale for weight  #以下代码用于获取权重的缩放因子（scale）
+        weight_scale_name = self.quantized_value_map[weight_name].scale_name  #从量化值映射表中，通过权重名称（weight_name）获取权重缩放因子的名称（scale_name）。
+        weight_initializer = find_by_name(weight_scale_name, self.model.initializer()) #从模型的初始化器（initializer，存储模型中固定值的张量）中，找到名称为 weight_scale_name 的初始化器（即权重缩放因子的张量）。
+        weight_scale = self.tensor_proto_to_array(weight_initializer) #将 ONNX 的张量协议格式（TensorProto）转换为 numpy 数组，得到权重的缩放因子数值（weight_scale）
 
         # get bias
-        bias_initializer = find_by_name(bias_name, self.model.initializer())
+        bias_initializer = find_by_name(bias_name, self.model.initializer())  #找偏置张量
         bias_data = self.tensor_proto_to_array(bias_initializer)
         quantized_bias_name = bias_name + "_quantized"
 
         # get scale for input
-        if input_name in self.quantized_value_map:
-            input_scale_name = self.quantized_value_map[input_name].scale_name
+        if input_name in self.quantized_value_map:  #检查输入名称是否在量化值映射表中（即输入是否已被量化）
+            input_scale_name = self.quantized_value_map[input_name].scale_name  #若输入已量化，则从映射表中直接获取输入缩放因子的名称
         elif input_name in self.quantization_params:
             _, input_scale_name, _, _, _ = self._get_quantization_params(input_name)
         else:
             raise ValueError("Expected {} to be in quantized value map for static quantization".format(input_name))
 
-        inputscale_initializer = find_by_name(input_scale_name, self.model.initializer())
+        inputscale_initializer = find_by_name(input_scale_name, self.model.initializer())  #找到输入缩放因子对应的初始化器（即输入缩放因子的张量）
         input_scale = self.tensor_proto_to_array(inputscale_initializer)
 
         # calcuate scale for bias
         bias_scale = input_scale * weight_scale
 
         # quantize bias
-        quantized_data = (np.asarray(bias_data) / bias_scale).round().astype(np.int32)
+        quantized_data = (np.asarray(bias_data) / bias_scale).round().astype(np.int32)  #将偏置数据（bias_data）转换为 numpy 数组；
+                                                                                        #除以偏置缩放因子（bias_scale），得到浮点数形式的量化前中间值
+                                                                                        #（round()）后转换为 32 位整数（np.int32）
 
-        # update bias initializer
+        # update bias initializer  #更新模型中偏置的初始化器（添加量化后的偏置）
         bias_np_data = np.asarray(quantized_data, dtype=np.int32).reshape(bias_initializer.dims)
         packed_bias_initializer = onnx.numpy_helper.from_array(bias_np_data, quantized_bias_name)
-        self.model.initializer().extend([packed_bias_initializer])
+        self.model.initializer().extend([packed_bias_initializer])  #将量化后的偏置初始化器添加到模型的初始化器列表中（更新模型）
 
-        # update scale initializer
+        # update scale initializer #添加量化偏置的缩放因子
         quantized_bias_scale_name = quantized_bias_name + "_scale"
         bias_scale_data = np.asarray(bias_scale, dtype=np.float32).reshape(-1)
         packed_bias_scale_initializer = onnx.numpy_helper.from_array(bias_scale_data, quantized_bias_scale_name)
-        self.model.initializer().extend([packed_bias_scale_initializer])
+        self.model.initializer().extend([packed_bias_scale_initializer]) #将偏置缩放因子的初始化器添加到模型的初始化器列表中。
 
-        # update zero initializer
+        # update zero initializer  #添加量化偏置的零点，固定为 0
         quantized_bias_zp_name = quantized_bias_name + "_zero_point"
         bias_zp_data = np.zeros(bias_scale.shape, dtype=np.int32).reshape(-1)
         packed_bias_zp_initializer = onnx.numpy_helper.from_array(bias_zp_data, quantized_bias_zp_name)
-        self.model.initializer().extend([packed_bias_zp_initializer])
+        self.model.initializer().extend([packed_bias_zp_initializer]) #将偏置零点的初始化器添加到模型的初始化器列表中。
 
         assert (bias_name not in self.quantized_value_map)
         quantized_value = QuantizedValue(bias_name, quantized_bias_name, quantized_bias_scale_name,
                                          quantized_bias_zp_name, QuantizedValueType.Initializer,
                                          0 if bias_scale_data.size > 1 else None)
-        self.quantized_value_map[bias_name] = quantized_value
+        self.quantized_value_map[bias_name] = quantized_value #将创建的 QuantizedValue 对象存入量化值映射表，键为原始偏置名称（bias_name），表示该偏置已被量化。
 
-        return quantized_bias_name
+        return quantized_bias_name  #返回量化后偏置的名称
 
     def contains_tensor(self, tensor_name):
         '''
@@ -646,6 +670,17 @@ class ONNXQuantizer:
         '''
         return (tensor_name in self.value_infos) or (tensor_name in self.tensor_names) or (tensor_name in self.generated_value_names)
 
+
+    #用于量化 ONNX 模型中节点（node）的输入
+    """
+    node：待量化输入的节点（ONNX 的NodeProto格式）。
+    indices：需要量化的输入索引列表（指定节点的哪些输入需要量化）。
+    initializer_use_weight_qType：布尔值，若为True，初始化器（如权重）使用权重量化类型（weight_qType），否则使用输入量化类型（input_qType）。
+    reduce_range：是否缩减量化范围（如将 8 位量化缩减为 7 位，减少精度损失）。
+    op_level_per_channel：是否在操作级支持按通道量化（针对卷积等按通道处理的权重）。
+    axis：按通道量化时的通道轴（默认-1，即最后一维）。
+    from_subgraph：是否来自子图（影响节点添加方式）。
+    """
     def quantize_inputs(self, node, indices, initializer_use_weight_qType=True, reduce_range=False, op_level_per_channel=False, axis=-1, from_subgraph=False):
         '''
         Given a node, this function quantizes the inputs as follows:
@@ -660,13 +695,13 @@ class ONNXQuantizer:
                      List of new QuantizeLinear nodes created)
         '''
 
-        scale_names = []
-        zero_point_names = []
-        quantized_input_names = []
-        nodes = []
+        scale_names = []  #用于存储输入量化的缩放因子（scale）名称。
+        zero_point_names = [] #用于存储输入量化的零点（zero point）名称。
+        quantized_input_names = [] #用于存储量化后的输入名称。
+        nodes = [] #用于存储新创建的QuantizeLinear节点。
 
         for input_index in indices:
-            node_input = node.input[input_index]
+            node_input = node.input[input_index]  #获取当前索引对应的输入名称（node.input是节点的输入列表）
 
             # Find if this input is already quantized
             if node_input in self.quantized_value_map:
@@ -676,10 +711,10 @@ class ONNXQuantizer:
                 quantized_input_names.append(quantized_value.q_name)
                 continue
 
-            # Quantize the input
-            initializer = find_by_name(node_input, self.model.initializer())
+            # Quantize the input  #当前输入未量化，开始执行量化。
+            initializer = find_by_name(node_input, self.model.initializer())  #从模型的初始化器（initializer，如权重等固定值张量）中查找该输入。
             if initializer is not None:
-                if self.per_channel and op_level_per_channel:
+                if self.per_channel and op_level_per_channel:  #若类配置了按通道量化（self.per_channel）且当前操作支持按通道量化（op_level_per_channel），则按通道量化。
                     q_weight_name, zp_name, scale_name = self.quantize_weight_per_channel(
                         initializer.name, self.weight_qType if initializer_use_weight_qType else self.input_qType,
                         axis, reduce_range)
@@ -688,32 +723,32 @@ class ONNXQuantizer:
                         initializer, self.weight_qType if initializer_use_weight_qType else self.input_qType,
                         reduce_range)
 
-                quantized_input_names.append(q_weight_name)
+                quantized_input_names.append(q_weight_name) #将量化后的初始化器名称添加到quantized_input_names
                 zero_point_names.append(zp_name)
                 scale_names.append(scale_name)
-            elif self.contains_tensor(node_input):
+            elif self.contains_tensor(node_input):  #若输入不是初始化器，但模型包含该张量（self.contains_tensor检查张量是否存在），则需要添加QuantizeLinear节点量化该张量。
                 # Add QuantizeLinear node.
                 qlinear_node = self.model.find_node_by_name(node_input + "_QuantizeLinear", self.new_nodes,
-                                                            self.model.graph())
+                                                            self.model.graph())  #检查是否已存在针对该输入的QuantizeLinear节点（名称格式为 “输入名 +_QuantizeLinear”）。
                 if qlinear_node is None:
-                    quantize_input_nodes = self._get_quantize_input_nodes(node, input_index, self.input_qType)
+                    quantize_input_nodes = self._get_quantize_input_nodes(node, input_index, self.input_qType) #调用_get_quantize_input_nodes方法生成量化输入所需的节点（通常包含QuantizeLinear及相关节点）。
                     if quantize_input_nodes is None:
                         return (None, None, None, None)
                     if from_subgraph:
                         self.add_new_nodes(quantize_input_nodes)
                     else:
                         nodes.extend(quantize_input_nodes)
-                    qlinear_node = quantize_input_nodes[-1]
+                    qlinear_node = quantize_input_nodes[-1]  #新生成的节点列表中，最后一个节点即为QuantizeLinear节点。
 
-                if qlinear_node.op_type == "QuantizeLinear":
-                    quantized_input_names.extend(qlinear_node.output)
-                    scale_names.append(qlinear_node.input[1])
-                    zero_point_names.append(qlinear_node.input[2])
+                if qlinear_node.op_type == "QuantizeLinear":  #若节点类型是QuantizeLinear（ONNX 标准量化节点）。
+                    quantized_input_names.extend(qlinear_node.output) #将QuantizeLinear的输出（量化后的值）添加到quantized_input_names。
+                    scale_names.append(qlinear_node.input[1]) #QuantizeLinear的第 2 个输入（input[1]）是缩放因子，其名称添加到scale_names。
+                    zero_point_names.append(qlinear_node.input[2]) #QuantizeLinear的第 3 个输入（input[2]）是零点，其名称添加到zero_point_names。
                 else:
                     quantized_input_names.append(qlinear_node.output[0])
                     scale_names.append(qlinear_node.output[1])
                     zero_point_names.append(qlinear_node.output[2])
-            elif self.parent is not None:
+            elif self.parent is not None:  #若输入既不是初始化器，也不是模型中的张量，但存在父节点（self.parent），则委托父节点处理量化。
                 (parent_quantized_input_names, parent_zero_point_names, parent_scale_names, _) = self.parent.quantize_inputs(
                     node,
                     [input_index],
@@ -729,8 +764,14 @@ class ONNXQuantizer:
             else:
                 raise ValueError('Invalid tensor name to quantize: {} @graph scope{}'.format(node_input, self.graph_scope))
 
-        return (quantized_input_names, zero_point_names, scale_names, nodes)
+        return (quantized_input_names, zero_point_names, scale_names, nodes) #返回四个列表：量化后的输入名称、零点名称、缩放因子名称、新创建的量化节点。
 
+
+"""用于对模型中的权重（weight）进行量化处理。它会生成量化后的权重、缩放因子（scale）和零点（zero point），并更新模型初始化器和量化映射表
+    weight：待量化的权重，以 ONNX 的TensorProto格式表示。
+    qType：量化后的数据类型（如UINT8、INT8等）。
+    reduce_range：是否缩减量化范围（如 8 位量化缩减为 7 位，减少精度损失）。
+    keep_float_weight：布尔值，若为True则仅生成缩放因子和零点，不量化权重本身；若为False则同时量化权重。"""
     def quantize_weight(self, weight, qType, reduce_range=False, keep_float_weight=False):
         '''
             :param weight: TensorProto initializer
@@ -750,26 +791,36 @@ class ONNXQuantizer:
 
         # Update packed weight, zero point, and scale initializers
         weight_data = self.tensor_proto_to_array(weight)
+        #输入：展平的权重数据（flatten().tolist()）、量化类型（qType）、是否对称量化（self.is_weight_symmetric）、是否缩减范围（self.reduce_range与reduce_range的逻辑与）。
         _, _, zero_point, scale, q_weight_data = quantize_data(weight_data.flatten().tolist(),
                                                                qType, self.is_weight_symmetric,
                                                                self.reduce_range and reduce_range)
-        scale_initializer = onnx.helper.make_tensor(scale_name, onnx_proto.TensorProto.FLOAT, [], [scale])
-        zero_initializer = onnx.helper.make_tensor(zp_name, qType, [], [zero_point])
+        scale_initializer = onnx.helper.make_tensor(scale_name, onnx_proto.TensorProto.FLOAT, [], [scale]) #创建缩放因子的初始化器
+        zero_initializer = onnx.helper.make_tensor(zp_name, qType, [], [zero_point])  #创建零点的初始化器
         self.model.initializer().extend([scale_initializer, zero_initializer])
 
-        if not keep_float_weight:
+        if not keep_float_weight:  #量化权重数据并更新模型
             q_weight_data = np.asarray(q_weight_data,
                                        dtype=onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[qType]).reshape(weight.dims)
             q_weight_initializer = onnx.numpy_helper.from_array(q_weight_data, q_weight_name)
             self.model.initializer().extend([q_weight_initializer])
 
-        # Log entry for this quantized weight
+        # Log entry for this quantized weight #记录该权重的量化信息到映射表
         quantized_value = QuantizedValue(weight.name, q_weight_name, scale_name, zp_name,
                                          QuantizedValueType.Initializer, None)
         self.quantized_value_map[weight.name] = quantized_value
 
         return q_weight_name, zp_name, scale_name
 
+
+"""用于对权重进行按通道量化（per-channel quantization）,对每个通道的权重单独计算缩放因子和零点，再将所有通道的量化数据组合成完整权重张量。
+与普通量化（对整个权重张量用同一套缩放因子和零点）不同，按通道量化为每个通道单独计算量化参数，能更好地适应不同通道的数值分布，常用于卷积层等按通道处理的权重
+    weight_name：待量化的权重名称。
+    weight_qType：量化后的数据类型（如INT8、UINT8等）。
+    channel_axis：通道所在的轴（如卷积层权重通常为[out_channels, in_channels, kH, kW]，channel_axis=0表示按输出通道量化）。
+    reduce_range：是否缩减量化范围（如 8 位量化用 7 位表示，减少精度损失）。
+    keep_float_weight：是否保留浮点权重（False则替换为量化权重，True仅生成量化参数）。
+"""
     def quantize_weight_per_channel(self, weight_name, weight_qType, channel_axis, reduce_range=True,
                                     keep_float_weight=False):
         # Find if this input is already quantized
@@ -777,19 +828,19 @@ class ONNXQuantizer:
             quantized_value = self.quantized_value_map[weight_name]
             return (quantized_value.q_name, quantized_value.zp_name, quantized_value.scale_name)
 
-        initializer = find_by_name(weight_name, self.model.initializer())
+        initializer = find_by_name(weight_name, self.model.initializer())  #weight_name的权重初始化器（TensorProto格式）
         if initializer is None:
             raise ValueError("{} is not an initializer", weight_name)
 
-        weights = self.tensor_proto_to_array(initializer)
-        channel_count = weights.shape[channel_axis]
+        weights = self.tensor_proto_to_array(initializer) #将 ONNX 的TensorProto格式权重转换为 numpy 数组，得到原始权重数据（weights）
+        channel_count = weights.shape[channel_axis] #获取通道数量：权重数组在channel_axis维度上的大小（如weights.shape=(32, 16, 3, 3)
         rmin_list = []
         rmax_list = []
         zero_point_list = []
         scale_list = []
-        quantized_per_channel_data_list = []
+        quantized_per_channel_data_list = [] #存储每个通道的量化后数据
         for i in range(channel_count):
-            per_channel_data = weights.take(i, channel_axis)
+            per_channel_data = weights.take(i, channel_axis)  #提取第i个通道的权重数据：通过take(i, channel_axis)从weights中沿channel_axis轴取出索引为i的子数组（单个通道的权重）。
             rmin, rmax, zero_point, scale, quantized_per_channel_data = quantize_data(
                 per_channel_data.flatten().tolist(), weight_qType,
                 self.is_weight_symmetric or weight_qType == onnx_proto.TensorProto.INT8, self.reduce_range and reduce_range)
@@ -799,29 +850,29 @@ class ONNXQuantizer:
             scale_list.append(scale)
             quantized_per_channel_data_list.append(quantized_per_channel_data)
 
-        # combine per_channel_data into one
-        reshape_dims = list(weights.shape)  # deep copy
-        reshape_dims[channel_axis] = 1  # only one per channel for reshape
-        quantized_weights = np.asarray(quantized_per_channel_data_list[0]).reshape(reshape_dims)
-        for i in range(1, len(quantized_per_channel_data_list)):
-            channel_weights = np.asarray(quantized_per_channel_data_list[i]).reshape(reshape_dims)
-            quantized_weights = np.concatenate((quantized_weights, channel_weights), channel_axis)
+        # combine per_channel_data into one  #将所有通道的量化数据组合成一个完整的权重数组（恢复原始形状）
+        reshape_dims = list(weights.shape)  # deep copy  #复制原始权重的形状（如(32, 16, 3, 3)），用于重塑单个通道的数据。
+        reshape_dims[channel_axis] = 1  # only one per channel for reshape #将形状中通道轴的维度改为 1（如channel_axis=0时，reshape_dims变为(1, 16, 3, 3)），以便单个通道数据能拼接成原始形状。
+        quantized_weights = np.asarray(quantized_per_channel_data_list[0]).reshape(reshape_dims) #初始化总量化权重数组：将第一个通道的量化数据转换为 numpy 数组，重塑为reshape_dims（单通道形状）。
+        for i in range(1, len(quantized_per_channel_data_list)): #遍历剩余通道（从第 1 个开始），将其量化数据拼接到总数组中。
+            channel_weights = np.asarray(quantized_per_channel_data_list[i]).reshape(reshape_dims) #将第i个通道的量化数据转换为 numpy 数组，重塑为reshape_dims（单通道形状）。
+            quantized_weights = np.concatenate((quantized_weights, channel_weights), channel_axis) #沿channel_axis轴拼接当前通道数据与总数组，逐步恢复原始权重的形状（如 32 个通道拼接后恢复为(32, 16, 3, 3)）。
 
         q_weight_name = weight_name + "_quantized"
         zp_name = weight_name + "_zero_point"
         scale_name = weight_name + "_scale"
 
         quantized_value = QuantizedValue(weight_name, q_weight_name, scale_name, zp_name,
-                                         QuantizedValueType.Initializer, None)
+                                         QuantizedValueType.Initializer, None) #创建QuantizedValue对象（量化信息封装）
         self.quantized_value_map[weight_name] = quantized_value
 
-        # Update packed weight, zero point, and scale initializers
-        zero_scale_shape = [initializer.dims[channel_axis]]
+        # Update packed weight, zero point, and scale initializers  #更新模型初始化器，添加量化后的权重、零点和缩放因子
+        zero_scale_shape = [initializer.dims[channel_axis]] #定义零点和缩放因子的形状：长度为通道数的一维数组（如 32 个通道则形状为[32]，与普通量化的标量形状不同）。
         scale_initializer = onnx.helper.make_tensor(scale_name, onnx_proto.TensorProto.FLOAT, zero_scale_shape,
                                                     scale_list)
         zero_initializer = onnx.helper.make_tensor(zp_name, weight_qType, zero_scale_shape, zero_point_list)
 
-        self.model.initializer().extend([scale_initializer, zero_initializer])
+        self.model.initializer().extend([scale_initializer, zero_initializer])  #将缩放因子和零点的初始化器添加到模型的初始化器列表中（更新模型）
 
         if not keep_float_weight:
             quantized_weights = np.asarray(
@@ -829,7 +880,7 @@ class ONNXQuantizer:
             q_weight_initializer = onnx.numpy_helper.from_array(quantized_weights, q_weight_name)
             self.model.initializer().extend([q_weight_initializer])
 
-        return (q_weight_name, zp_name, scale_name)
+        return (q_weight_name, zp_name, scale_name)  #返回量化后的权重名称、零点名称和缩放因子名称
 
     def _dequantize_value(self, value_name):
         '''
