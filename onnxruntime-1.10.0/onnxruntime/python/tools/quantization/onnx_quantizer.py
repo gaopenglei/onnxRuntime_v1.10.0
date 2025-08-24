@@ -918,26 +918,33 @@ class ONNXQuantizer:
             if dequantize_node is not None:
                 self.new_nodes.append(dequantize_node)
 
+"""核心功能是计算模型中张量的量化参数（缩放因子 scale 和零点 zero point）。它会先根据特定节点（Clip、Relu）的输出范围调整输入范围，
+再基于张量的数值范围和量化类型，通过公式计算每个张量的量化参数。"""
     def calculate_quantization_params(self):
-        if self.tensors_range is None:
+        if self.tensors_range is None:  #检查张量范围字典（self.tensors_range）是否为空：该字典存储了每个张量的数值范围（键为张量名称，值为 (rmin, rmax)，即张量的最小值和最大值），是计算量化参数的前提。
             return
 
         # adjust tensor_ranges for input of Clip and Relu node
-        for node in self.model.nodes():
-            if node.op_type not in ['Clip', 'Relu']:
+        # 针对 Clip 和 Relu 节点的输入张量，调整其数值范围 —— 因为这两类节点会改变张量的数值范围（如 Relu 会将负数截断为 0），需用节点输出的实际范围反向修正输入范围，确保量化参数准确。
+        for node in self.model.nodes():  #遍历模型中的所有节点（self.model.nodes() 返回模型的节点列表，每个节点为 ONNX 的 NodeProto 格式）。
+            if node.op_type not in ['Clip', 'Relu']:  #仅处理 Clip（数值裁剪）和 Relu节点.
                 continue
             if not self.should_quantize(node):
                 continue
-            if len(self.model.input_name_to_nodes()[node.input[0]]) != 1:
+            if len(self.model.input_name_to_nodes()[node.input[0]]) != 1:  #若输入张量被多个节点使用（列表长度 >1），则不能仅用当前节点的输出范围修正其范围（避免影响其他节点），因此跳过。
                 continue
-            if node.input[0] not in self.tensors_range.keys() or node.output[0] not in self.tensors_range.keys():
+            if node.input[0] not in self.tensors_range.keys() or node.output[0] not in self.tensors_range.keys(): #检查输入张量（node.input[0]）和输出张量（node.output[0]）的范围是否都在 self.tensors_range 中 —— 只有两者都有范围数据，才能进行修正。
                 continue
+            """核心修正逻辑：将 Clip/Relu 节点输出张量的范围赋值给输入张量的范围。
+                   例：Relu 节点输入范围为 (-5, 10)，输出范围为 (0, 10)（负数被截断），则修正输入范围为 (0, 10)，确保后续计算输入量化参数时，基于实际有效的数值范围（而非原始范围）。
+            """
             self.tensors_range[node.input[0]] = self.tensors_range[node.output[0]]
 
-        quantization_params = {}
-        for tensor_name in self.tensors_range.keys():
+        quantization_params = {} #初始化量化参数字典，用于存储每个张量的量化参数
+        for tensor_name in self.tensors_range.keys():  #遍历 self.tensors_range 中的所有张量名称，逐个计算量化参数
             rmin, rmax = self.tensors_range[tensor_name]
-            qmin, qmax = get_qmin_qmax_for_qType(self.input_qType)
+            qmin, qmax = get_qmin_qmax_for_qType(self.input_qType) #根据量化类型（self.input_qType，如 UINT8、INT8）获取该类型的量化最小值（qmin）和最大值（qmax）：
+                                                                       #例：UINT8 的 qmin=0，qmax=255；INT8 的 qmin=-128，qmax=127。
 
             quantization_params[tensor_name] = compute_scale_zp(rmin, rmax,
                                                                 qmin, qmax,
@@ -946,6 +953,10 @@ class ONNXQuantizer:
         return quantization_params
 
 
+"""
+这段代码是 ONNXQuantizer 类的静态方法 CleanGraphInitializers，核心功能是清理 ONNX 图（及子图）中未使用的初始化器（如量化模型后遗留的无用权重、缩放因子 / 零点等），
+同时处理子图的递归清理，并返回清理后的图和 “找不到的张量名列表”。
+"""
     # static method
     def CleanGraphInitializers(graph, model):
         '''

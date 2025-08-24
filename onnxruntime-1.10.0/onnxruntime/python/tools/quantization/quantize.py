@@ -555,5 +555,13 @@ def quantize_qat(model_input: Path,
          ↓                    ↓                    ↓           ↓
       动态变化              固定不变            计算操作      结果
 
+#################################################################################################################
+5. 量化参数计算逻辑
+量化的核心是将浮点数范围 [rmin, rmax] 映射到整数范围 [qmin, qmax]，公式如下：
+
+ 1. 缩放因子（scale）：scale = (rmax - rmin) / (qmax - qmin)（描述 “1 个整数单位对应多少浮点数单位”）；
+ 2.零点（zero_point）：
+   非对称量化（激活常用）：zero_point = round(qmin - rmin / scale)（确保 rmin 映射到 qmin，rmax 映射到 qmax）；
+   对称量化（权重常用）：强制 zero_point=0，scale = max(abs(rmin), abs(rmax)) / max(abs(qmin), abs(qmax))（避免零点引入偏差）
 
 """

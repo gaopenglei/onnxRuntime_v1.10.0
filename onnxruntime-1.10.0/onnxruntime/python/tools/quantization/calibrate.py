@@ -37,13 +37,21 @@ class CalibrationDataReader(metaclass=abc.ABCMeta):
         """generate the input data dict for ONNXinferenceSession run"""
         raise NotImplementedError
 
-
+"""
+定义用于模型校准（Calibration）的基类CalibraterBase，主要用于量化过程中收集张量（tensor）的动态范围信息（如最小值、最大值）。
+校准是模型量化（将浮点模型转换为低精度整数模型）的关键步骤，直接影响量化模型的精度."""
+"""
+CalibraterBase是一个抽象基类，提供了校准流程的基础框架，包括模型加载、图增强（augment_graph）、校准张量选择、推理会话创建等通用功能。
+具体的校准逻辑（如图增强方式、数据收集、范围计算）需要通过子类实现。"""
 class CalibraterBase:
     def __init__(self, model, op_types_to_calibrate=[], augmented_model_path='augmented_model.onnx'):
         '''
         :param model: ONNX model to calibrate. It can be a ModelProto or a model path
         :param op_types_to_calibrate: operator types to calibrate. By default, calibrate all the float32/float16 tensors.
         :param augmented_model_path: save augmented model to this path.
+
+        model：待校准的 ONNX 模型，可为模型路径（字符串）或onnx.ModelProto对象。
+        op_types_to_calibrate：需要校准的算子类型列表，默认校准所有浮点（float32/float16）张量相关的算子。
         '''
         if isinstance(model, string_types):
             self.model = onnx.load(model)
@@ -67,6 +75,7 @@ class CalibraterBase:
     def set_execution_providers(self, execution_providers=['CPUExecutionProvider']):
         '''
         reset the execution providers to execute the collect_data. It triggers to re-creating inference session.
+        重置推理会话的执行提供者（如 CPU、GPU 等），并重新创建推理会话。
         '''
         self.execution_providers = execution_providers
         self._create_inference_session()
@@ -88,6 +97,14 @@ class CalibraterBase:
             tensors (set): set of tensor name.
             value_infos (dict): tensor name to value info.
         '''
+        """
+        核心逻辑：
+          1.收集模型中所有的张量信息：包括graph.value_info（中间张量）、graph.input（输入张量）、graph.output（输出张量）。
+          2.排除初始化器（initializer，模型中的常量张量，无需校准）。
+          3.对每个节点，若其算子类型在op_types_to_calibrate中（或列表为空时匹配所有算子），则检查其输入 / 输出张量：
+              仅保留类型为 float32（TensorProto.FLOAT）或 float16（TensorProto.FLOAT16）的张量。
+              最终得到需要校准的张量集合。
+        """
         value_infos = {vi.name: vi for vi in model.graph.value_info}
         value_infos.update({ot.name: ot for ot in model.graph.output})
         value_infos.update({it.name: it for it in model.graph.input})
@@ -108,6 +125,17 @@ class CalibraterBase:
 
         return tensors_to_calibrate, value_infos
 
+'''
+下面这些抽象方法（需子类实现）：
+这些方法定义了校准的核心流程，但具体逻辑由子类实现（如基于最小 - 最大范围的校准、移动平均校准等）。
+
+  augment_graph：增强原始模型图。
+    作用：通常在图中插入额外节点（如Identity节点），用于捕获待校准张量的数值，保存增强后的模型到augmented_model_path。
+  collect_data：收集校准数据。
+    作用：通过CalibrationDataReader读取输入数据，执行增强后的模型，收集待校准张量的实际数值（如推理过程中的中间张量值）。可多次调用以累积多批数据。
+  compute_range：计算张量的动态范围。
+    作用：基于collect_data收集的数据，计算每个待校准张量的 [min, max] 范围（用于量化时确定缩放因子）。
+'''
     def get_augment_model(self):
         '''
         return: augmented onnx model
@@ -134,7 +162,9 @@ class CalibraterBase:
         '''
         raise NotImplementedError
 
-
+"""
+该类是 CalibraterBase 的子类，实现了最小 - 最大校准（Min-Max Calibration）逻辑，用于计算待量化张量的动态范围（最小值和最大值），
+是模型量化中最常用的校准方法之一."""
 class MinMaxCalibrater(CalibraterBase):
     def __init__(self, model, op_types_to_calibrate=[], augmented_model_path='augmented_model.onnx'):
         '''
@@ -142,40 +172,43 @@ class MinMaxCalibrater(CalibraterBase):
         :param op_types_to_calibrate: operator types to calibrate. By default, calibrate all the float32/float16 tensors.
         :param augmented_model_path: save augmented model to this path.
         '''
-        super(MinMaxCalibrater, self).__init__(model, op_types_to_calibrate, augmented_model_path)
-        self.intermediate_outputs = []
-        self.calibrate_tensors_range = None
+        super(MinMaxCalibrater, self).__init__(model, op_types_to_calibrate, augmented_model_path) #调用父类 CalibraterBase 的构造方法，完成模型加载、图增强触发等基础初始化。
+        self.intermediate_outputs = [] #存储增强模型运行时产生的中间输出（主要是 ReduceMin 和 ReduceMax 节点的结果）。
+        self.calibrate_tensors_range = None #最终存储每个待校准张量的 [min, max] 范围（字典类型，键为张量名，值为 (min, max) 元组）。
         self.num_model_outputs = len(self.model.graph.output)
-        self.model_original_outputs = set(output.name for output in self.model.graph.output)
+        self.model_original_outputs = set(output.name for output in self.model.graph.output) #存储原始模型输出的名称集合（用于过滤掉非校准相关的输出）。
 
-    def augment_graph(self):
+    def augment_graph(self): #增强原始模型图（核心是插入 ReduceMin 和 ReduceMax 节点，用于收集张量的最小值和最大值）。
         '''
         Adds ReduceMin and ReduceMax nodes to all quantization_candidates op type nodes in
         model and ensures their outputs are stored as part of the graph output
         :return: augmented ONNX model
         '''
+        """先复制原始模型（避免修改原模型），再调用 onnx.shape_inference.infer_shapes 进行形状推断，确保所有张量的形状信息完整（后续创建 Reduce 节点需要依赖形状）。
+        """
         model = onnx_proto.ModelProto()
         model.CopyFrom(self.model)
         model = onnx.shape_inference.infer_shapes(model)
 
-        added_nodes = []
-        added_outputs = []
-        tensors, value_infos = self.select_tensors_to_calibrate(model) 
+        added_nodes = [] #added_nodes 存储新增的 ReduceMin/ReduceMax 节点；
+        added_outputs = [] #added_outputs 存储这些节点的输出信息。
+        tensors, value_infos = self.select_tensors_to_calibrate(model)  #获取需要校准的张量集合（tensors）和它们的类型信息（value_infos）。
 
-        for tensor in tensors:
+        for tensor in tensors:  #遍历每个待校准的张量，为其创建 ReduceMin 和 ReduceMax 节点：
 
             # When doing ReduceMax/ReduceMin, ORT can't reduce on dim with value of 0 if 'keepdims' is false.
             # To make the code simple, we always let keepdims to be 1.
-            keepdims = 1
+            keepdims = 1  #设置 Reduce 节点保留维度（避免因维度为 0 导致 ONNX Runtime 报错）
 
             # dim could be:
             #   [dim_param: "batch_size", dim_value: 256, dim_value: 36, dim_value: 64],
             #   [dim_value: 0],
             #   ...
             # Please see the definition of TensorShapeProto https://github.com/onnx/onnx/blob/master/onnx/onnx.proto#L651
-            dim = value_infos[tensor].type.tensor_type.shape.dim
-            shape = (1,) if len(dim) == 1 else tuple(1 for i in range(len(dim)))
+            dim = value_infos[tensor].type.tensor_type.shape.dim  #获取当前张量的形状信息（来自 value_infos）
+            shape = (1,) if len(dim) == 1 else tuple(1 for i in range(len(dim))) #构造 Reduce 节点输出的形状（全为 1 的维度，与原始张量维度数一致，例如原始形状为 (256, 36)，则 Reduce 输出形状为 (1, 1)）。
 
+            # 为每个张量创建 ReduceMin 和 ReduceMax 节点：
             # Adding ReduceMin nodes
             reduce_min_name = tensor + '_ReduceMin'
             reduce_min_node = onnx.helper.make_node('ReduceMin', [tensor], [tensor + '_ReduceMin'], reduce_min_name, keepdims=keepdims)
@@ -195,7 +228,7 @@ class MinMaxCalibrater(CalibraterBase):
         onnx.save(model, self.augmented_model_path)
         self.augment_model = model
 
-    def clear_collected_data(self):
+    def clear_collected_data(self):  #清空 self.intermediate_outputs 中收集的中间输出数据（用于重置校准状态，例如多轮数据收集后清理）。
         self.intermediate_outputs = []
 
     def collect_data(self, data_reader: CalibrationDataReader):
@@ -211,7 +244,7 @@ class MinMaxCalibrater(CalibraterBase):
         self.compute_range()
         self.clear_collected_data()
 
-    def merge_range(self, old_range, new_range):
+    def merge_range(self, old_range, new_range):  #合并新旧两组张量范围（用于多轮数据收集时，累积全局的 min 和 max）
         if not old_range:
             return new_range
 
@@ -222,7 +255,7 @@ class MinMaxCalibrater(CalibraterBase):
 
         return new_range
 
-    def compute_range(self):
+    def compute_range(self):  #计算每个待校准张量的 [min, max] 范围。
         ''' 
         Compute the min-max range of tensor
         :return: dictionary mapping: {added node names: (ReduceMin, ReduceMax) pairs }
