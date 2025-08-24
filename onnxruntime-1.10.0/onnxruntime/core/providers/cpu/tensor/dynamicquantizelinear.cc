@@ -8,17 +8,23 @@
 #include "core/util/math_cpuonly.h"
 #include "core/util/qmath.h"
 
+/*
+这段代码是 ONNX Runtime（ORT）中 CPU 平台的动态量化算子（DynamicQuantizeLinear）实现，针对 uint8_t 数据类型。
+与静态量化（需提前通过校准获取 scale 和 zero_point）不同，动态量化在算子执行时实时计算输入张量的量化参数（scale 和 zero_point），
+再完成浮点到整数的量化，适用于输入数据分布动态变化的场景。
+*/
 namespace onnxruntime {
 
 ONNX_CPU_OPERATOR_TYPED_KERNEL(
-    DynamicQuantizeLinear,
-    11,
-    uint8_t,
-    KernelDefBuilder()
-        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>()),
-    DynamicQuantizeLinear<uint8_t>);
+    DynamicQuantizeLinear,  // 算子名称（需与 ONNX 规范中的算子名一致）
+    11,                     // 算子支持的 ONNX 版本（从 ONNX 11 版本开始支持该算子）
+    uint8_t,              // 量化后的数据类型（此处为无符号 8 位整数）
+    KernelDefBuilder()    // 内核定义构建器（约束算子输入输出类型、设备类型等）
+        .TypeConstraint("T2", DataTypeImpl::GetTensorType<uint8_t>()),   // 约束输出 Y（T2）的类型为 uint8_t
+    DynamicQuantizeLinear<uint8_t>);  // 对应的内核类（模板类，实例化为 uint8_t 版本）
 
-// formula is Y = X / Scale + ZeroPoint
+// formula is Y = X / Scale + ZeroPoint // 量化公式：Y = round(X / Scale) + ZeroPoint（X是输入浮点，Y是量化后uint8整数，需钳位到[0,255]）
+//该方法实现 **「实时计算量化参数 → 输出参数 → 量化输入张量」** 的完整流程，
 template <typename T>
 Status DynamicQuantizeLinear<T>::Compute(OpKernelContext* ctx) const {
   auto x_ptr = ctx->Input<Tensor>(0);
